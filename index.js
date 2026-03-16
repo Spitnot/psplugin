@@ -3,26 +3,26 @@
  *
  * Applies a rugged glued-paper texture effect to the active Photoshop document.
  *
- * Folder layout (plugin root, not tracked in git — files are heavy):
+ * Folder layout (plugin root, NOT tracked in git — assets are too heavy):
  *   textures/001.jpg … 040.jpg   — paper texture (screen + multiply layers)
  *   displace/001.psd … 040.psd   — displacement maps (wrinkle / fold shape)
  *
  * Fix for UXP batchPlay: transform after placeEvent
  * ─────────────────────────────────────────────────
  * placeEvent leaves the Smart Object in Photoshop's internal free-transform
- * mode.  Any transform batchPlay issued while that mode is active succeeds
+ * mode. Any transform batchPlay issued while that mode is active succeeds
  * silently but has no effect on the layer.
  *
  * Solution: within the SAME modal as placeEvent, re-select the layer by its
- * ID.  That select action commits the pending free-transform so the layer is
- * in a clean state.  A second modal can then read real bounds and apply a
- * proper transform using pixelsUnit (absolute dimensions).
+ * ID. That select commits the pending free-transform so the layer is clean.
+ * A second modal can then read real bounds and apply transform with pixelsUnit.
+ *
+ * NOTE: all require() calls are intentionally placed INSIDE functions.
+ * Top-level require() in a UXP panel script can throw before the DOM is ready,
+ * killing the script silently and leaving the panel completely blank.
  */
 
 /* global require */
-const { app }                         = require("photoshop");
-const { core, action }                = require("photoshop");
-const { localFileSystem: fs }         = require("uxp").storage;
 
 // ─── constants ───────────────────────────────────────────────────────────────
 
@@ -62,17 +62,20 @@ function pickRandom() {
 
 /**
  * Build session tokens for the texture jpg and displace psd that correspond
- * to the given numeric index.  Both folders live at the plugin root.
+ * to the given numeric index. Both folders live at the plugin root.
  */
 async function getTokens(index) {
-  const pluginFolder  = await fs.getPluginFolder();
-  const paddedName    = String(index).padStart(3, "0");
+  const { storage } = require("uxp");
+  const fs = storage.localFileSystem;
+
+  const pluginFolder   = await fs.getPluginFolder();
+  const paddedName     = String(index).padStart(3, "0");
 
   const textureFolder  = await pluginFolder.getEntry("textures");
   const displaceFolder = await pluginFolder.getEntry("displace");
 
-  const textureEntry  = await textureFolder.getEntry(paddedName + ".jpg");
-  const displaceEntry = await displaceFolder.getEntry(paddedName + ".psd");
+  const textureEntry   = await textureFolder.getEntry(paddedName + ".jpg");
+  const displaceEntry  = await displaceFolder.getEntry(paddedName + ".psd");
 
   return {
     textureToken:  fs.createSessionToken(textureEntry),
@@ -84,15 +87,14 @@ async function getTokens(index) {
 
 /**
  * Place a file as a Smart Object and scale it to COVER the document canvas.
- *
  * Returns the new layer's ID.
  *
  * Two-modal pattern (required to work around the free-transform issue):
- *
- *  Modal 1 — placeEvent + select (commits free-transform)
- *  Modal 2 — read real bounds → compute cover scale → transform (pixelsUnit)
+ *   Modal 1 — placeEvent + select (commits the pending free-transform)
+ *   Modal 2 — read real bounds → cover-scale → transform (pixelsUnit)
  */
 async function placeAndFit(token, doc, name, blendMode, opacity) {
+  const { core, action } = require("photoshop");
   let layerId;
 
   // ── Modal 1: place and immediately commit free-transform ──────────────────
@@ -111,9 +113,9 @@ async function placeAndFit(token, doc, name, blendMode, opacity) {
 
     layerId = placeResult.ID;
 
-    // KEY FIX — selecting the layer by ID in the same modal commits the
-    // pending free-transform that placeEvent leaves behind.  Without this,
-    // any transform in a subsequent modal is a silent no-op.
+    // KEY FIX — selecting by ID in the same modal commits the pending
+    // free-transform left behind by placeEvent. Without this, the transform
+    // in Modal 2 succeeds silently but the layer dimensions don't change.
     await action.batchPlay([{
       _obj: "select",
       _target: [{ _ref: "layer", _id: layerId }],
@@ -127,7 +129,7 @@ async function placeAndFit(token, doc, name, blendMode, opacity) {
     const layer = doc.layers.find((l) => l.id === layerId);
     if (!layer) throw new Error(`Layer ${layerId} not found after place.`);
 
-    const b = layer.bounds;                      // top/left/bottom/right in px
+    const b      = layer.bounds;
     const layerW = b.right  - b.left;
     const layerH = b.bottom - b.top;
 
@@ -135,13 +137,12 @@ async function placeAndFit(token, doc, name, blendMode, opacity) {
       throw new Error("Placed layer has zero dimensions; cannot scale.");
     }
 
-    // Cover strategy: pick the scale factor that fills the canvas in both axes.
-    const scale  = Math.max(doc.width / layerW, doc.height / layerH);
-    const newW   = Math.round(layerW * scale);
-    const newH   = Math.round(layerH * scale);
+    // Cover: pick the scale factor that fills the canvas in both axes.
+    const scale = Math.max(doc.width / layerW, doc.height / layerH);
+    const newW  = Math.round(layerW * scale);
+    const newH  = Math.round(layerH * scale);
 
-    // Transform using absolute pixel dimensions.
-    // pixelsUnit is more reliable than percentUnit immediately after a place.
+    // Absolute pixel dimensions — more reliable than percentUnit post-place.
     await action.batchPlay([{
       _obj: "transform",
       _target: [{ _ref: "layer", _id: layerId }],
@@ -155,7 +156,7 @@ async function placeAndFit(token, doc, name, blendMode, opacity) {
       _options: { dialogOptions: "dontDisplay" },
     }], {});
 
-    // Set blend mode, opacity, and name in one descriptor.
+    // Name, blend mode and opacity in one descriptor.
     await action.batchPlay([{
       _obj: "set",
       _target: [{ _ref: "layer", _id: layerId }],
@@ -175,6 +176,7 @@ async function placeAndFit(token, doc, name, blendMode, opacity) {
 // ─── core: full posterizer effect ────────────────────────────────────────────
 
 async function applyPosterEffect(textureToken, displaceToken, params) {
+  const { app, core, action } = require("photoshop");
   const doc = app.activeDocument;
   if (!doc) throw new Error("No active document.");
 
@@ -204,7 +206,6 @@ async function applyPosterEffect(textureToken, displaceToken, params) {
     const dup  = await orig.duplicate();
     await dup.moveBefore(doc.layers[0]);
 
-    // Convert to Smart Object so the Displace filter is non-destructive.
     await action.batchPlay([{
       _obj: "newPlacedLayer",
       _options: { dialogOptions: "dontDisplay" },
@@ -250,7 +251,7 @@ async function applyPosterEffect(textureToken, displaceToken, params) {
         _obj: "select",
         _target: [{ _ref: "layer", _id: lid }],
         selectionModifier: {
-          _enum: "_selectionModifierType",
+          _enum: "selectionModifierType",
           _value: "addToSelection",
         },
         makeVisible: false,
@@ -277,6 +278,7 @@ async function applyPosterEffect(textureToken, displaceToken, params) {
 // ─── save helpers ─────────────────────────────────────────────────────────────
 
 async function saveAsCopy() {
+  const { action } = require("photoshop");
   try {
     await action.batchPlay([{
       _obj: "exportDocumentAs",
@@ -289,6 +291,7 @@ async function saveAsCopy() {
 }
 
 async function flattenAndSave() {
+  const { app, core, action } = require("photoshop");
   const doc = app.activeDocument;
   try {
     await core.executeAsModal(async () => {
