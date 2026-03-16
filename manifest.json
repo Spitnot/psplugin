@@ -1,0 +1,29 @@
+{
+  "id": "com.example.place-and-scale",
+  "name": "Place & Scale",
+  "version": "1.0.0",
+  "manifestVersion": 6,
+  "host": [
+    {
+      "app": "PS",
+      "minVersion": "24.0"
+    }
+  ],
+  "entrypoints": [
+    {
+      "type": "panel",
+      "id": "mainPanel",
+      "label": { "default": "Place & Scale" },
+      "main": "index.html"
+    }
+  ],
+  "requiredPermissions": {
+    "localFileSystem": "fullAccess",
+    "network": {
+      "domains": ["allow-any"]
+    },
+    "ipc": {
+      "allowCodeGenerationFromStrings": false
+    }
+  }
+}
