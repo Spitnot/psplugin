@@ -2,33 +2,233 @@
 <html>
 <head>
   <meta charset="UTF-8" />
-  <title>Place &amp; Scale</title>
+  <title>Posterizer</title>
   <style>
-    body {
-      font-family: var(--uxp-host-font-family, sans-serif);
-      font-size: var(--uxp-host-font-size, 12px);
-      color: var(--uxp-host-text-color, #fff);
-      background: var(--uxp-host-background-color, #2b2b2b);
-      padding: 12px;
-      margin: 0;
+    /* ─── Reset & Base ─────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg0:     #1a1a1a;
+      --bg1:     #232323;
+      --bg2:     #2c2c2c;
+      --bg3:     #363636;
+      --accent:  #c8a96e;
+      --accent2: #e8c98e;
+      --text0:   #f0ece4;
+      --text1:   #b0aa9e;
+      --text2:   #706a60;
+      --danger:  #c86e6e;
+      --success: #6ec898;
+      --radius:  6px;
+      --font: 'Adobe Clean', -apple-system, BlinkMacSystemFont, sans-serif;
     }
-    button {
-      width: 100%;
-      padding: 8px;
-      margin-top: 8px;
-      cursor: pointer;
-    }
-    #status {
-      margin-top: 8px;
+    html, body {
+      width: 100%; height: 100%;
+      background: var(--bg0);
+      color: var(--text0);
+      font-family: var(--font);
       font-size: 11px;
-      color: var(--uxp-host-label-text-color, #aaa);
-      word-break: break-all;
+      line-height: 1.4;
+      overflow-x: hidden;
     }
+    #app { display: flex; flex-direction: column; gap: 0; padding-bottom: 8px; }
+
+    /* ─── Header ─────────────────────────────────────────────── */
+    .header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 12px 14px 10px;
+      border-bottom: 1px solid var(--bg3);
+      background: var(--bg1);
+    }
+    .header-title {
+      display: flex; align-items: center; gap: 7px;
+      font-size: 13px; font-weight: 600; letter-spacing: 0.06em;
+      color: var(--accent);
+    }
+    .header-icon { font-size: 14px; opacity: 0.9; }
+    .header-sub {
+      font-size: 9px; color: var(--text2);
+      letter-spacing: 0.1em; text-transform: uppercase;
+    }
+
+    /* ─── Preview strip ──────────────────────────────────────── */
+    .preview-strip {
+      background: var(--bg1); border-bottom: 1px solid var(--bg3);
+      padding: 8px 14px;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .preview-label { font-size: 10px; color: var(--text1); }
+    .preview-seed  { font-size: 9px; color: var(--text2); font-variant-numeric: tabular-nums; letter-spacing: 0.05em; }
+
+    /* ─── Buttons ────────────────────────────────────────────── */
+    .btn-apply {
+      margin: 12px 14px 6px;
+      width: calc(100% - 28px);
+      padding: 11px 0;
+      background: var(--accent); color: #1a1500;
+      border: none; border-radius: var(--radius);
+      font-family: var(--font); font-size: 12px; font-weight: 700;
+      letter-spacing: 0.05em; cursor: pointer;
+      display: flex; align-items: center; justify-content: center; gap: 8px;
+      transition: background 0.15s, transform 0.1s;
+    }
+    .btn-apply:hover { background: var(--accent2); }
+    .btn-apply:active { transform: scale(0.98); }
+    .btn-apply:disabled { background: var(--bg3); color: var(--text2); cursor: not-allowed; transform: none; }
+
+    .btn-regen {
+      margin: 0 14px 6px;
+      width: calc(100% - 28px);
+      padding: 8px 0;
+      background: transparent; color: var(--text1);
+      border: 1px solid var(--bg3); border-radius: var(--radius);
+      font-family: var(--font); font-size: 11px; cursor: pointer;
+      display: flex; align-items: center; justify-content: center; gap: 7px;
+      transition: border-color 0.15s, color 0.15s;
+    }
+    .btn-regen:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+    .btn-regen:disabled { opacity: 0.35; cursor: not-allowed; }
+    .btn-icon { font-size: 11px; }
+
+    /* ─── Section labels ─────────────────────────────────────── */
+    .section-label {
+      padding: 10px 14px 4px;
+      font-size: 9px; letter-spacing: 0.12em; text-transform: uppercase;
+      color: var(--text2); border-top: 1px solid var(--bg2); margin-top: 4px;
+    }
+
+    /* ─── Controls ───────────────────────────────────────────── */
+    .controls { padding: 2px 14px 0; display: flex; flex-direction: column; gap: 12px; }
+    .control-row { display: flex; flex-direction: column; gap: 4px; }
+    .control-header { display: flex; justify-content: space-between; align-items: baseline; }
+    .control-header label { font-size: 10px; color: var(--text1); font-weight: 500; }
+    .control-value { font-size: 10px; color: var(--accent); font-variant-numeric: tabular-nums; min-width: 24px; text-align: right; }
+    .control-hint { font-size: 9px; color: var(--text2); }
+
+    /* ─── Sliders ────────────────────────────────────────────── */
+    .slider-track { width: 100%; }
+    input[type="range"] {
+      -webkit-appearance: none; appearance: none;
+      width: 100%; height: 3px;
+      background: var(--bg3); border-radius: 2px; outline: none; cursor: pointer;
+    }
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none; appearance: none;
+      width: 13px; height: 13px; border-radius: 50%;
+      background: var(--accent); cursor: pointer;
+      border: 2px solid var(--bg0);
+      transition: background 0.15s, transform 0.1s;
+    }
+    input[type="range"]::-webkit-slider-thumb:hover { background: var(--accent2); transform: scale(1.2); }
+
+    /* ─── Save row ───────────────────────────────────────────── */
+    .save-row { display: flex; gap: 8px; padding: 6px 14px 0; }
+    .btn-save, .btn-flatten {
+      flex: 1; padding: 8px 0; border-radius: var(--radius);
+      font-family: var(--font); font-size: 10px; font-weight: 600;
+      cursor: pointer; transition: all 0.15s;
+      border: 1px solid var(--bg3); background: var(--bg2); color: var(--text1);
+      letter-spacing: 0.04em;
+    }
+    .btn-save:hover:not(:disabled), .btn-flatten:hover:not(:disabled) {
+      border-color: var(--accent); color: var(--accent); background: var(--bg1);
+    }
+    .btn-save:disabled, .btn-flatten:disabled { opacity: 0.3; cursor: not-allowed; }
+
+    /* ─── Status bar ─────────────────────────────────────────── */
+    .status-bar {
+      margin: 10px 14px 0; padding: 7px 10px;
+      background: var(--bg1); border-radius: var(--radius);
+      border: 1px solid var(--bg3);
+      font-size: 9.5px; color: var(--text2);
+      min-height: 30px; display: flex; align-items: center; line-height: 1.3;
+      transition: color 0.2s, border-color 0.2s;
+    }
+    .status-bar.ok      { color: var(--success); border-color: #2a4a38; }
+    .status-bar.error   { color: var(--danger);  border-color: #4a2a2a; }
+    .status-bar.working { color: var(--accent);  border-color: #4a3a1a; }
   </style>
 </head>
 <body>
-  <button id="btnPlace">Place &amp; Scale to Canvas</button>
-  <div id="status">Ready.</div>
+  <div id="app">
+    <header class="header">
+      <div class="header-title">
+        <span class="header-icon">◈</span>
+        <span>Posterizer</span>
+      </div>
+      <span class="header-sub">Paper Texture Engine</span>
+    </header>
+
+    <div class="preview-strip">
+      <div class="preview-label" id="previewLabel">Sin textura aplicada</div>
+      <div class="preview-seed"  id="previewSeed">—</div>
+    </div>
+
+    <button class="btn-apply" id="btnApply">
+      <span class="btn-icon">▲</span> Aplicar textura
+    </button>
+    <button class="btn-regen" id="btnRegen" disabled>
+      <span class="btn-icon">↻</span> Regenerar
+    </button>
+
+    <div class="section-label">Parámetros</div>
+    <div class="controls">
+
+      <div class="control-row">
+        <div class="control-header">
+          <label>Desplazamiento</label>
+          <span class="control-value" id="valDisplace">12</span>
+        </div>
+        <div class="slider-track">
+          <input type="range" id="slDisplace" min="2" max="30" value="12" step="1" />
+        </div>
+        <div class="control-hint">Intensidad de arrugas y pliegues</div>
+      </div>
+
+      <div class="control-row">
+        <div class="control-header">
+          <label>Sombras (Multiply)</label>
+          <span class="control-value" id="valShadow">60</span>
+        </div>
+        <div class="slider-track">
+          <input type="range" id="slShadow" min="20" max="90" value="60" step="1" />
+        </div>
+        <div class="control-hint">Profundidad de pliegues oscuros</div>
+      </div>
+
+      <div class="control-row">
+        <div class="control-header">
+          <label>Brillos (Screen)</label>
+          <span class="control-value" id="valScreen">28</span>
+        </div>
+        <div class="slider-track">
+          <input type="range" id="slScreen" min="5" max="55" value="28" step="1" />
+        </div>
+        <div class="control-hint">Reflexión de luz en el papel</div>
+      </div>
+
+      <div class="control-row">
+        <div class="control-header">
+          <label>Textura base</label>
+          <span class="control-value" id="valBase">85</span>
+        </div>
+        <div class="slider-track">
+          <input type="range" id="slBase" min="30" max="100" value="85" step="1" />
+        </div>
+        <div class="control-hint">Visibilidad del papel (capa Normal)</div>
+      </div>
+
+    </div>
+
+    <div class="section-label">Guardar</div>
+    <div class="save-row">
+      <button class="btn-save"    id="btnSave"    disabled>Guardar como copia</button>
+      <button class="btn-flatten" id="btnFlatten" disabled>Aplanar y guardar</button>
+    </div>
+
+    <div class="status-bar" id="statusBar">
+      Carga un documento y pulsa Aplicar
+    </div>
+  </div>
   <script src="index.js"></script>
 </body>
 </html>
