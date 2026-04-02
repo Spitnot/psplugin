@@ -1,208 +1,354 @@
 /**
- * Place & Scale — UXP Photoshop Plugin
+ * Posterizer — index.js
  *
- * Fix for: transform batchPlay after placeEvent has no effect
+ * Applies a rugged glued-paper texture effect to the active Photoshop document.
  *
- * Root cause
- * ----------
- * placeEvent leaves the new Smart Object layer in Photoshop's internal
- * "free transform" mode.  Even when executed in a separate executeAsModal
- * call, that pending free-transform context prevents any subsequent
- * `transform` descriptor from taking effect (the call succeeds silently
- * but the layer dimensions are unchanged).
+ * Folder layout (plugin root, NOT tracked in git — assets are too heavy):
+ *   textures/001.jpg … 040.jpg   — paper texture (screen + multiply layers)
+ *   displace/001.psd … 040.psd   — displacement maps (wrinkle / fold shape)
  *
- * Fix
- * ---
- * 1. In the SAME modal as placeEvent, immediately re-select the newly
- *    placed layer by its ID.  That `select` action commits / cancels the
- *    pending free-transform context and leaves the layer in a clean state.
- * 2. In a second modal, read the actual document and layer pixel dimensions
- *    from the DOM API, compute the "cover" scale factor, then apply it via
- *    a `transform` descriptor that targets the layer explicitly by ID.
- *    Using pixelsUnit (absolute dimensions) is more reliable than
- *    percentUnit for this operation.
+ * Fix for UXP batchPlay: transform after placeEvent
+ * ─────────────────────────────────────────────────
+ * placeEvent leaves the Smart Object in Photoshop's internal free-transform
+ * mode. Any transform batchPlay issued while that mode is active succeeds
+ * silently but has no effect on the layer.
+ *
+ * Solution: within the SAME modal as placeEvent, re-select the layer by its
+ * ID. That select commits the pending free-transform so the layer is clean.
+ * A second modal can then read real bounds and apply transform with pixelsUnit.
+ *
+ * NOTE: all require() calls are intentionally placed INSIDE functions.
+ * Top-level require() in a UXP panel script can throw before the DOM is ready,
+ * killing the script silently and leaving the panel completely blank.
  */
 
 /* global require */
-const { app, constants } = require("photoshop");
-const { core, action } = require("photoshop");
-const { localFileSystem: fs } = require("uxp").storage;
 
-// ─── helpers ────────────────────────────────────────────────────────────────
+// ─── constants ───────────────────────────────────────────────────────────────
 
-/** Write a line to the status <div> in the panel. */
-function setStatus(msg) {
-  const el = document.getElementById("status");
-  if (el) el.textContent = msg;
-  console.log("[place-and-scale]", msg);
+const TEXTURE_COUNT = 40;
+const state = { lastTextureIndex: -1 };
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
+
+function $(id) { return document.getElementById(id); }
+
+function setStatus(msg, type) {
+  const el = $("statusBar");
+  if (!el) return;
+  el.textContent = msg;
+  el.className   = "status-bar" + (type ? " " + type : "");
+  console.log("[posterizer]", msg);
+}
+
+function getParams() {
+  return {
+    displaceScale: parseFloat($("slDisplace").value),
+    shadowOpacity: parseFloat($("slShadow").value),
+    screenOpacity: parseFloat($("slScreen").value),
+    baseOpacity:   parseFloat($("slBase").value),
+  };
+}
+
+/** Pick a random texture index, avoiding immediate repeat. */
+function pickRandom() {
+  let idx;
+  do {
+    idx = Math.floor(Math.random() * TEXTURE_COUNT) + 1;
+  } while (idx === state.lastTextureIndex && TEXTURE_COUNT > 1);
+  state.lastTextureIndex = idx;
+  return idx;
 }
 
 /**
- * Pick a local file using the UXP file picker.
- * Returns a UXP File entry or null if cancelled.
+ * Build session tokens for the texture jpg and displace psd that correspond
+ * to the given numeric index. Both folders live at the plugin root.
  */
-async function pickFile() {
-  const entry = await fs.getFileForOpening({
-    allowMultiple: false,
-    types: ["jpg", "jpeg", "png", "tif", "tiff", "psb", "psd"],
-  });
-  return entry || null;
+async function getTokens(index) {
+  const { storage } = require("uxp");
+  const fs = storage.localFileSystem;
+
+  const pluginFolder   = await fs.getPluginFolder();
+  const paddedName     = String(index).padStart(3, "0");
+
+  const textureFolder  = await pluginFolder.getEntry("textures");
+  const displaceFolder = await pluginFolder.getEntry("displace");
+
+  const textureEntry   = await textureFolder.getEntry(paddedName + ".jpg");
+  const displaceEntry  = await displaceFolder.getEntry(paddedName + ".psd");
+
+  return {
+    textureToken:  fs.createSessionToken(textureEntry),
+    displaceToken: fs.createSessionToken(displaceEntry),
+  };
 }
 
-// ─── core logic ─────────────────────────────────────────────────────────────
+// ─── core: place + scale ─────────────────────────────────────────────────────
 
 /**
- * Place a file as a Smart Object and scale it to cover the document canvas.
+ * Place a file as a Smart Object and scale it to COVER the document canvas.
+ * Returns the new layer's ID.
  *
- * @param {import("uxp").storage.File} fileEntry  The file to place.
+ * Two-modal pattern (required to work around the free-transform issue):
+ *   Modal 1 — placeEvent + select (commits the pending free-transform)
+ *   Modal 2 — read real bounds → cover-scale → transform (pixelsUnit)
  */
-async function placeAndScale(fileEntry) {
+async function placeAndFit(token, doc, name, blendMode, opacity) {
+  const { core, action } = require("photoshop");
+  let layerId;
+
+  // ── Modal 1: place and immediately commit free-transform ──────────────────
+  await core.executeAsModal(async () => {
+    const [placeResult] = await action.batchPlay([{
+      _obj: "placeEvent",
+      null: { _path: token, _kind: "local" },
+      freeTransformCenterState: { _enum: "quadCenterState", _value: "QCSAverage" },
+      offset: {
+        _obj: "offset",
+        horizontal: { _unit: "pixelsUnit", _value: 0 },
+        vertical:   { _unit: "pixelsUnit", _value: 0 },
+      },
+      _options: { dialogOptions: "dontDisplay" },
+    }], {});
+
+    layerId = placeResult.ID;
+
+    // KEY FIX — selecting by ID in the same modal commits the pending
+    // free-transform left behind by placeEvent. Without this, the transform
+    // in Modal 2 succeeds silently but the layer dimensions don't change.
+    await action.batchPlay([{
+      _obj: "select",
+      _target: [{ _ref: "layer", _id: layerId }],
+      makeVisible: false,
+      _options: { dialogOptions: "dontDisplay" },
+    }], {});
+  }, { commandName: "Place Smart Object" });
+
+  // ── Modal 2: read bounds, compute cover-scale, transform, set props ───────
+  await core.executeAsModal(async () => {
+    const layer = doc.layers.find((l) => l.id === layerId);
+    if (!layer) throw new Error(`Layer ${layerId} not found after place.`);
+
+    const b      = layer.bounds;
+    const layerW = b.right  - b.left;
+    const layerH = b.bottom - b.top;
+
+    if (layerW === 0 || layerH === 0) {
+      throw new Error("Placed layer has zero dimensions; cannot scale.");
+    }
+
+    // Cover: pick the scale factor that fills the canvas in both axes.
+    const scale = Math.max(doc.width / layerW, doc.height / layerH);
+    const newW  = Math.round(layerW * scale);
+    const newH  = Math.round(layerH * scale);
+
+    // Absolute pixel dimensions — more reliable than percentUnit post-place.
+    await action.batchPlay([{
+      _obj: "transform",
+      _target: [{ _ref: "layer", _id: layerId }],
+      freeTransformCenterState: { _enum: "quadCenterState", _value: "QCSAverage" },
+      width:  { _unit: "pixelsUnit", _value: newW },
+      height: { _unit: "pixelsUnit", _value: newH },
+      interfaceIconFrameDimmed: {
+        _enum: "interpolationType",
+        _value: "bicubicAutomatic",
+      },
+      _options: { dialogOptions: "dontDisplay" },
+    }], {});
+
+    // Name, blend mode and opacity in one descriptor.
+    await action.batchPlay([{
+      _obj: "set",
+      _target: [{ _ref: "layer", _id: layerId }],
+      to: {
+        _obj: "layer",
+        name,
+        mode:    { _enum: "blendMode",   _value: blendMode },
+        opacity: { _unit: "percentUnit", _value: opacity   },
+      },
+      _options: { dialogOptions: "dontDisplay" },
+    }], {});
+  }, { commandName: "Scale and Configure Layer" });
+
+  return layerId;
+}
+
+// ─── core: full posterizer effect ────────────────────────────────────────────
+
+async function applyPosterEffect(textureToken, displaceToken, params) {
+  const { app, core, action } = require("photoshop");
   const doc = app.activeDocument;
   if (!doc) throw new Error("No active document.");
 
-  // UXP token for the chosen file (required by placeEvent)
-  const sessionToken = fs.createSessionToken(fileEntry);
+  // Remove any previous "Posterizer" group.
+  setStatus("Cleaning previous effect…", "working");
+  await core.executeAsModal(async () => {
+    const old = doc.layers.filter((l) => l.name === "Posterizer");
+    for (const layer of old) await layer.delete();
+  }, { commandName: "Remove Previous Posterizer" });
 
-  let layerId;
-
-  // ── Modal 1: place the Smart Object and immediately commit free-transform ──
-  //
-  // After placeEvent, Photoshop keeps the layer in free-transform mode.
-  // Re-selecting the same layer by ID within the same modal commits that
-  // pending state so the layer is "clean" before we leave this modal.
-  await core.executeAsModal(
-    async () => {
-      const [placeResult] = await action.batchPlay(
-        [
-          {
-            _obj: "placeEvent",
-            null: { _path: sessionToken, _kind: "local" },
-            // Place centred on the canvas origin; we will resize next.
-            freeTransformCenterState: {
-              _enum: "quadCenterState",
-              _value: "QCSAverage",
-            },
-            offset: {
-              _obj: "offset",
-              horizontal: { _unit: "pixelsUnit", _value: 0 },
-              vertical: { _unit: "pixelsUnit", _value: 0 },
-            },
-            _options: { dialogOptions: "dontDisplay" },
-          },
-        ],
-        {}
-      );
-
-      layerId = placeResult.ID;
-      setStatus(`Placed layer ID ${layerId}. Committing free-transform…`);
-
-      // KEY FIX ─ select the layer by ID to commit the free-transform.
-      // Without this, transform in any subsequent modal is a no-op.
-      await action.batchPlay(
-        [
-          {
-            _obj: "select",
-            _target: [{ _ref: "layer", _id: layerId }],
-            makeVisible: false,
-            _options: { dialogOptions: "dontDisplay" },
-          },
-        ],
-        {}
-      );
-    },
-    { commandName: "Place Smart Object" }
+  // Place texture layers.
+  setStatus("Placing highlights layer…", "working");
+  const brillosId = await placeAndFit(
+    textureToken, doc, "textura — brillos", "screen",   params.screenOpacity
   );
 
-  // ── Modal 2: compute cover-scale and apply transform ──────────────────────
-  await core.executeAsModal(
-    async () => {
-      // Read dimensions from the DOM API (reliable, no batchPlay needed).
-      const docWidth = doc.width;   // pixels
-      const docHeight = doc.height; // pixels
-
-      // Find the placed layer by ID.
-      const layer = doc.layers.find((l) => l.id === layerId);
-      if (!layer) throw new Error(`Layer ${layerId} not found after place.`);
-
-      const b = layer.bounds; // { top, left, bottom, right } in pixels
-      const layerWidth  = b.right  - b.left;
-      const layerHeight = b.bottom - b.top;
-
-      if (layerWidth === 0 || layerHeight === 0) {
-        throw new Error("Placed layer has zero dimensions; cannot scale.");
-      }
-
-      // "Cover" strategy: scale so the layer fills the canvas in both axes,
-      // preserving aspect ratio (the larger scale factor wins).
-      const scaleX = docWidth  / layerWidth;
-      const scaleY = docHeight / layerHeight;
-      const scale  = Math.max(scaleX, scaleY);
-
-      const newWidth  = Math.round(layerWidth  * scale);
-      const newHeight = Math.round(layerHeight * scale);
-
-      setStatus(
-        `Scaling ${layerWidth}×${layerHeight} → ${newWidth}×${newHeight} ` +
-          `(canvas ${docWidth}×${docHeight})`
-      );
-
-      // Apply the transform.
-      // - _target by layer ID ensures the correct layer is transformed even
-      //   if selection changed between modals.
-      // - pixelsUnit is more reliable than percentUnit here because
-      //   Photoshop's % is relative to the layer's CURRENT size, which can
-      //   be ambiguous immediately after a place operation.
-      // - interfaceIconFrameDimmed sets the interpolation method
-      //   (bicubicAutomatic is the PS default for enlargements).
-      const [transformResult] = await action.batchPlay(
-        [
-          {
-            _obj: "transform",
-            _target: [{ _ref: "layer", _id: layerId }],
-            freeTransformCenterState: {
-              _enum: "quadCenterState",
-              _value: "QCSAverage",
-            },
-            width:  { _unit: "pixelsUnit", _value: newWidth  },
-            height: { _unit: "pixelsUnit", _value: newHeight },
-            interfaceIconFrameDimmed: {
-              _enum: "interpolationType",
-              _value: "bicubicAutomatic",
-            },
-            _options: { dialogOptions: "dontDisplay" },
-          },
-        ],
-        {}
-      );
-
-      if (transformResult == null) {
-        // This should no longer happen after the free-transform commit above,
-        // but guard just in case.
-        throw new Error(
-          "transform returned undefined — free-transform may still be active."
-        );
-      }
-    },
-    { commandName: "Scale to Canvas" }
+  setStatus("Placing shadows layer…", "working");
+  const sombrasId = await placeAndFit(
+    textureToken, doc, "textura — sombras", "multiply", params.shadowOpacity
   );
 
-  setStatus("Done — layer placed and scaled to cover the canvas.");
+  // Duplicate the background, convert to Smart Object, apply Displace filter.
+  setStatus("Applying displacement…", "working");
+  let imgId;
+  await core.executeAsModal(async () => {
+    const orig = doc.layers[doc.layers.length - 1];
+    const dup  = await orig.duplicate();
+    await dup.moveBefore(doc.layers[0]);
+
+    await action.batchPlay([{
+      _obj: "newPlacedLayer",
+      _options: { dialogOptions: "dontDisplay" },
+    }], {});
+
+    await action.batchPlay([{
+      _obj: "displace",
+      horizontalScale: params.displaceScale,
+      verticalScale:   params.displaceScale,
+      displacementMap: { _enum: "displacementMap", _value: "stretchToFit" },
+      undefinedArea:   { _enum: "undefinedArea",   _value: "repeatEdgePixels" },
+      displaceFile:    { _path: displaceToken, _kind: "local" },
+      _options: { dialogOptions: "dontDisplay" },
+    }], {});
+
+    imgId = doc.activeLayers[0].id;
+    await action.batchPlay([{
+      _obj: "set",
+      _target: [{ _ref: "layer", _enum: "ordinal", _value: "targetEnum" }],
+      to: { _obj: "layer", name: "imagen — desplazada" },
+      _options: { dialogOptions: "dontDisplay" },
+    }], {});
+  }, { commandName: "Displacement Map" });
+
+  // Place the base paper layer (normal blend, semi-transparent).
+  setStatus("Placing base paper layer…", "working");
+  const papelId = await placeAndFit(
+    textureToken, doc, "papel — base", "normal", params.baseOpacity
+  );
+
+  // Select all four layers and group them.
+  setStatus("Grouping layers…", "working");
+  await core.executeAsModal(async () => {
+    await action.batchPlay([{
+      _obj: "select",
+      _target: [{ _ref: "layer", _id: brillosId }],
+      makeVisible: false,
+      _options: { dialogOptions: "dontDisplay" },
+    }], {});
+
+    for (const lid of [sombrasId, imgId, papelId]) {
+      await action.batchPlay([{
+        _obj: "select",
+        _target: [{ _ref: "layer", _id: lid }],
+        selectionModifier: {
+          _enum: "selectionModifierType",
+          _value: "addToSelection",
+        },
+        makeVisible: false,
+        _options: { dialogOptions: "dontDisplay" },
+      }], {});
+    }
+
+    await action.batchPlay([{
+      _obj: "make",
+      _target: [{ _ref: "layerSection" }],
+      from:  { _ref: "layer", _enum: "ordinal", _value: "targetEnum" },
+      using: { _obj: "layerSection", name: "Posterizer" },
+      _options: { dialogOptions: "dontDisplay" },
+    }], {});
+  }, { commandName: "Group Layers" });
+
+  const padded = String(state.lastTextureIndex).padStart(3, "0");
+  setStatus(`Texture #${padded} applied ✓`, "ok");
+  $("previewLabel").textContent = `Textura ${padded}.jpg`;
+  $("previewSeed").textContent  = `Displace: ${params.displaceScale}px`;
+  $("btnRegen").disabled = $("btnSave").disabled = $("btnFlatten").disabled = false;
 }
 
-// ─── UI wiring ───────────────────────────────────────────────────────────────
+// ─── save helpers ─────────────────────────────────────────────────────────────
 
-document.getElementById("btnPlace").addEventListener("click", async () => {
+async function saveAsCopy() {
+  const { action } = require("photoshop");
   try {
-    setStatus("Picking file…");
-    const file = await pickFile();
-    if (!file) {
-      setStatus("Cancelled.");
-      return;
-    }
-    setStatus(`Placing ${file.name}…`);
-    await placeAndScale(file);
-  } catch (err) {
-    setStatus(`Error: ${err.message}`);
-    console.error(err);
+    await action.batchPlay([{
+      _obj: "exportDocumentAs",
+      _options: { dialogOptions: "display" },
+    }], { synchronousExecution: false });
+    setStatus("Exported ✓", "ok");
+  } catch {
+    setStatus("Export cancelled.", "");
+  }
+}
+
+async function flattenAndSave() {
+  const { app, core, action } = require("photoshop");
+  const doc = app.activeDocument;
+  try {
+    await core.executeAsModal(async () => {
+      await action.batchPlay([{
+        _obj: "flattenImage",
+        _options: { dialogOptions: "dontDisplay" },
+      }], {});
+    }, { commandName: "Flatten" });
+    await doc.save();
+    $("btnRegen").disabled = $("btnSave").disabled = $("btnFlatten").disabled = true;
+    $("previewLabel").textContent = "Saved ✓";
+    $("previewSeed").textContent  = "—";
+    setStatus("Saved ✓", "ok");
+  } catch (e) {
+    setStatus(`Error: ${e.message}`, "error");
+  }
+}
+
+// ─── UI wiring ────────────────────────────────────────────────────────────────
+
+// Sync slider display values.
+[
+  ["slDisplace", "valDisplace"],
+  ["slShadow",   "valShadow"  ],
+  ["slScreen",   "valScreen"  ],
+  ["slBase",     "valBase"    ],
+].forEach(([sliderId, labelId]) => {
+  const slider = $(sliderId);
+  const label  = $(labelId);
+  if (slider && label) {
+    slider.addEventListener("input", () => { label.textContent = slider.value; });
   }
 });
+
+async function runEffect() {
+  setStatus("Selecting texture…", "working");
+  try {
+    const idx = pickRandom();
+    const { textureToken, displaceToken } = await getTokens(idx);
+    await applyPosterEffect(textureToken, displaceToken, getParams());
+  } catch (e) {
+    setStatus(`Error: ${e.message}`, "error");
+    console.error(e);
+  }
+}
+
+$("btnApply").addEventListener("click", async () => {
+  $("btnApply").disabled = true;
+  try   { await runEffect(); }
+  finally { $("btnApply").disabled = false; }
+});
+
+$("btnRegen").addEventListener("click", async () => {
+  $("btnRegen").disabled = $("btnApply").disabled = true;
+  try   { await runEffect(); }
+  finally { $("btnRegen").disabled = $("btnApply").disabled = false; }
+});
+
+$("btnSave").addEventListener("click", () => saveAsCopy());
+$("btnFlatten").addEventListener("click", () => flattenAndSave());
